@@ -1,0 +1,131 @@
+#!/bin/python
+
+import sys
+import ovsdbapp.backend.ovs_idl.connection
+from ovsdbapp.schema.ovn_northbound.impl_idl import OvnNbApiIdlImpl
+import xml.etree.ElementTree as ET
+
+import logging
+from logging.handlers import SysLogHandler
+
+
+class QemuOvnHook(object):
+
+    def __init__(self):
+        self.__setup_logging()
+        self.qemu_hook_states = {
+            'prepare': self.__prepare,
+            'start': self.__start,
+            'started': self.__start,
+            'stopped': self.__stopped,
+            'release': self.__release,
+            'migrate': self.__migrate,
+            'restore': self.__restore,
+            'reconnect': self.__reconnect,
+            'attach': self.__attach
+        }
+
+    def __prepare(self):
+        pass
+
+    def __start(self):
+        self.__find_metadata()
+        self.__find_iface_params()
+        self.__find_mac_address()
+        self.__lsp_add()
+
+    def __stopped(self):
+        self.__find_metadata()
+        self.__find_iface_params()
+        self.__find_mac_address()
+        self.__lsp_del()
+
+    def __release(self):
+        self.__find_metadata()
+        self.__find_iface_params()
+        self.__find_mac_address()
+        self.__lsp_del()
+
+    def __migrate(self):
+        pass
+
+    def __restore(self):
+        pass
+
+    def __reconnect(self):
+        pass
+
+    def __attach(self):
+        pass
+
+    def __setup_logging(self):
+        handler = SysLogHandler(address='/dev/log')
+        fmt = logging.Formatter('qemu: %(levelname)s: %(message)s')
+        handler.setFormatter(fmt)
+
+        self.LOG = logging.getLogger('libvirtd-hook')
+        self.LOG.setLevel(logging.INFO)
+        self.LOG.addHandler(handler)
+
+    def __ovn_connect(self):
+        ovsidl = ovsdbapp.backend.ovs_idl.connection.OvsdbIdl.from_server("tcp:%s:6641" % self.ip, 'OVN_Northbound')
+        ovsdb_connection = ovsdbapp.backend.ovs_idl.connection.Connection(idl=ovsidl,timeout=100)
+        return OvnNbApiIdlImpl(ovsdb_connection)
+
+    def __find_metadata(self):
+        metadata = self.root.findall("./metadata/*")
+        if len(metadata) and metadata is not None:
+            self.ip = metadata[0].attrib['northd']
+            self.switch = metadata[0].attrib['switch']
+            self.LOG.info("ip: %s, switch %s", self.ip, self.switch)
+        else:
+            sys.exit(0)
+
+    def __find_iface_params(self):
+        params = self.root.findall('.//parameters[@interfaceid]')
+        if len(params) and params is not None:
+            self.iface_id = params[0].attrib['interfaceid']
+            self.LOG.info("iface_id: %s", self.iface_id)
+        else:
+            sys.exit(0)
+
+    def __find_mac_address(self):
+        mac = self.root.findall('.//mac[@address]')
+        if len(mac) and mac is not None:
+            self.mac_address = mac[0].attrib['address']
+            self.LOG.info("mac address: %s", self.mac_address)
+        else:
+            sys.exit(0)
+
+    def __lsp_add(self):
+        idl = self.__ovn_connect()
+        idl.lsp_add(self.switch, self.iface_id, may_exist=True,
+                    addresses=[self.mac_address]).execute()
+
+    def __lsp_del(self):
+        idl = self.__ovn_connect()
+        idl.lsp_del(self.iface_id, self.switch).execute()
+
+    def process(self):
+        if len(sys.argv) < 3:
+            self.LOG.error("hook not provided enough arguments.")
+            sys.exit(0)
+
+        try:
+            self.vm_name = sys.argv[1]
+            state = sys.argv[2]
+            self.root = ET.fromstring(sys.stdin.read())
+
+            self.qemu_hook_states[state]()
+
+        except:
+            pass
+
+
+def main():
+    qemu = QemuOvnHook()
+    qemu.process()
+
+
+if __name__ =='__main__':
+    main()

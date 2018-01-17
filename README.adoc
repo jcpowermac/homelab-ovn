@@ -1,0 +1,472 @@
+= Using Open Virtual Network Lab Layer-3 Switch Replacement
+:doctype: book
+:compat-mode!:
+:numbered:
+:chapter-label:
+:specialnumbered!:
+:experimental:
+:listing-caption: Listing
+:toc:
+:icons: font
+:toclevels: 3
+ifdef::backend-pdf[]
+:pagenums: :pygments-style: bw :source-highlighter: pygments
+endif::[]
+:toc-placement!:
+toc::[]
+
+
+[[motivation]]
+== Motivation
+
+The current switch is a Cisco Catalyst 4006 w/Supervisor V. The chassis
+is 17 years old and the supervisor almost eight years old. The age plus
+the amount of power required to run I decided it was time to go. I have
+a significantly newer switch that is unfortunately only layer-2. Of
+course a sane person would say that is good enough.
+
+[[configuration]]
+== Configuration
+
+Just a fair warning I would never claim to be an expert on networking,
+Open vSwitch or OVN. To get this to work was mostly working from
+other individual's blog posts, documentation, etc. If something is
+incorrect please either submit an issue or pull request. With that said
+let's get started.
+
+[[installation]]
+=== Installation and initial configuration
+
+All the nodes directly participating geneve overlay will be Fedora 27.
+All the following commands will be based on Fedora. The configuration of
+OVN should generally be distribution independent.
+
+[[ovn-northbound-database-node]]
+==== OVN northbound database node
+
+First let's install some packages.
+
+[source,bash]
+----
+dnf install openvswitch \
+            openvswitch-ovn-central \
+            openvswitch-ovn-common \
+            openvswitch-ovn-host \
+            python2-openvswitch \
+            python3-openvswitch -y
+----
+
+If you want to use the container version of Skydive install docker as well. (recommended)
+[source,bash]
+----
+dnf install docker \
+            docker-compose -y
+----
+
+Then start and enable openvswitch and OVN services.
+
+----
+systemctl start openvswitch
+systemctl enable openvswitch
+systemctl start ovn-northd
+systemctl enable ovn-northd
+----
+
+[[hypervisor-nodes]]
+==== Hypervisor nodes
+
+Hypervisor in this case is any node that is to be native on OVN. In my
+case that is any Fedora physical node including my laptop - at least
+when its docked.
+
+[source,bash]
+----
+sudo dnf install openvswitch \
+                 openvswitch-ovn-common \
+                 openvswitch-ovn-host
+----
+
+If you want Skydive install docker.
+
+[source,bash]
+----
+sudo dnf install docker \
+                 docker-compose -y
+----
+
+Enable and start services, wait to start `ovn-controller` until the next
+section.
+
+[source,bash]
+----
+systemctl start openvswitch
+systemctl enable openvswitch
+systemctl enable ovn-controller
+----
+
+
+
+
+[[allow-north-and-south-bound-connections]]
+==== Allow north and south bound connections
+
+On the node running `ovn-northd` execute the following commands
+to allow remote connections.
+
+[source,bash]
+----
+ovn-nbctl set-connection ptcp:6641
+ovn-sbctl set-connection ptcp:6642
+ovs-appctl -t ovsdb-server ovsdb-server/add-remote ptcp:6640
+----
+
+==== Configure ovn-controller on hypervisor nodes
+
+The http://docs.openvswitch.org/en/latest/howto/docker/[docker how to]
+provides the commands required to configure the controller. I also
+listed them below.
+
+[source,bash]
+----
+CENTRAL_IP=172.30.1.10  <1>
+ENCAP_TYPE=geneve
+LOCAL_IP=172.30.1.52    <2>
+
+ovs-vsctl set open . external_ids:ovn-remote="tcp:${CENTRAL_IP}:6642"
+ovs-vsctl set open . external_ids:ovn-nb="tcp:${CENTRAL_IP}:6641"
+ovs-vsctl set open . external_ids:ovn-encap-ip=${LOCAL_IP}
+ovs-vsctl set open . external_ids:ovn-encap-type="${ENCAP_TYPE}"
+----
+<1> IP address of the node running `ovn-northd`
+<2> IP address of current node
+
+After configuration start the `ovn-controller`.
+
+[source,bash]
+----
+systemctl start ovn-controller
+----
+
+If you run `ovn-vsctl show` you should see at least a new bridge
+`br-int`.
+
+[source,bash]
+----
+$ sudo ovs-vsctl show
+90a55931-3706-4d55-9913-4a6e1f4b09e5
+    Bridge br-int
+        fail_mode: secure
+        Port br-int
+            Interface br-int
+                type: internal
+----
+
+[[add-gateway-node]]
+==== Gateway node
+
+While I am in the process of migrating to OVN I need access to existing
+devices on the _legacy_ network.  It will also be required for devices
+that do not support OVN.  Not sure if this is technically the best
+way to do this but it works.  Additional OVN configuration is required which
+will be listed below.
+
+I made the assumption that IP forwarding would be required so I enabled it.
+[source,bash]
+----
+net.ipv4.ip_forward = 1
+----
+
+Configure the `br-dmz` Open vSwitch bridge. This will be in file
+`/etc/sysconfig/network-scripts/ifcfg-br-dmz`
+
+[source,bash]
+----
+DEVICE=br-dmz
+ONBOOT=yes
+BOOTPROTO=none
+TYPE=OVSBridge
+DEVICETYPE=ovs
+OVS_EXTRA="set Open_vSwitch . external-ids:ovn-bridge-mappings=dmz_localnet:br-dmz" <1>
+----
+<1> Map the `dmz_localnet` switch port to the `br-dmz` bridge.
+
+Configure the physical interface attached to the `legacy` network
+and add to the `br-dmz` bridge. The IP address will be defined in OVN.
+This configuration will be in file `/etc/sysconfig/network-scripts/ifcfg-enp2s5`.
+
+[source,bash]
+----
+NAME="enp2s5"
+DEVICE="enp2s5"
+ONBOOT="yes"
+NETBOOT="yes"
+IPV6INIT="no"
+BOOTPROTO="none"
+DEFROUTE="no"
+IPV4_FAILURE_FATAL="no"
+IPV6_AUTOCONF="no"
+IPV6_DEFROUTE="no"
+IPV6_FAILURE_FATAL="no"
+
+TYPE=OVSPort
+DEVICETYPE=ovs
+OVS_BRIDGE=br-dmz
+----
+
+Finally bring up the bridge and interface.
+
+[source,bash]
+----
+ifup br-dmz
+ifup enp2s5
+----
+
+[[hypervisor-nodes-network-config]]
+==== Hypervisor node network config
+
+[source,bash]
+----
+DEVICE=bromine
+NAME=bromine
+TYPE=OVSIntPort
+DEVICETYPE=ovs
+OVS_BRIDGE=br-int
+OVS_EXTRA="set Interface bromine external_ids:iface-id=sw51_bromine" <1>
+IPADDR=172.31.51.52
+NETMASK=255.255.255.0
+GATEWAY=172.31.51.1
+DEFROUTE=yes
+MTU=1500
+DNS1=10.53.252.123
+DNS2=10.53.252.246
+----
+<1> The `iface-id` will be name provided in the `lsp-add` command.
+
+
+[[create-ovn-switches-routers-and-static-routes]]
+=== Create OVN switches, routers and static routes
+
+The topology and most of the OVN configuration below were modifications from
+http://blog.spinhirne.com/2016/09/the-ovn-gateway-router.html[this
+guide] so I recommend reading it for additional information.
+
+[[adding-logical-switches]]
+==== Adding Logical Switches
+
+Normal switches: `sw50`, `sw51`, and `sw52`.
+
+Transit Switch use between router `r0` and the gateway router `gr0`. Assuming
+this is to allow `r0` to be distributed while maintaining a connection to the
+localized `gr0`.
+
+[source,bash]
+----
+desk=sw51
+transit=tsw0
+outsw=osw0
+prod=sw52
+ose=sw50
+
+ovn-nbctl --may-exist ls-add ${desk}
+ovn-nbctl --may-exist ls-add ${transit}
+ovn-nbctl --may-exist ls-add ${outsw}
+ovn-nbctl --may-exist ls-add ${prod}
+ovn-nbctl --may-exist ls-add ${ose}
+----
+
+[[adding-logical-routers]]
+==== Adding Logical Routers
+
+Only need two routers `r0` and `gr0`.
+
+[source,bash]
+----
+router=r0
+gr=gr0
+
+ovn-nbctl --may-exist lr-add ${router}
+chassis_uuid=$(ovn-sbctl --bare --columns name find Chassis hostname=ovn-gateway0.virtomation.com)
+ovn-nbctl create Logical_Router name=${gr} options:chassis=${chassis_uuid} <1>
+----
+<1> The gateway router must be configured on a specific node or chassis.
+
+[[adding-logical-router-ports]]
+==== Adding Logical Router Ports
+
+
+[source,bash]
+----
+ovn-nbctl --may-exist lrp-add ${router} ${router}_${desk} 02:ac:10:1f:33:01 172.31.51.1/24
+ovn-nbctl --may-exist lrp-add ${router} ${router}_${prod} 02:ac:10:1f:34:01 172.31.52.1/24
+ovn-nbctl --may-exist lrp-add ${router} ${router}_${ose} 02:ac:10:1f:32:01 172.31.50.1/24
+ovn-nbctl --may-exist lrp-add ${router} ${router}_${transit} 02:ac:10:1f:ff:02 172.31.255.2/30
+ovn-nbctl --may-exist lrp-add ${gr} ${gr}_${transit} 02:ac:10:1f:ff:01 172.31.255.1/30
+ovn-nbctl --may-exist lrp-add ${gr} ${gr}_${outsw} 02:ac:10:1f:0c:f6 10.53.12.246/24
+----
+
+[[adding-static-routes]]
+==== Adding Static Routes
+
+----
+ovn-nbctl lr-route-add ${gr} 0.0.0.0/0 10.53.12.1           <1>
+ovn-nbctl lr-route-add ${gr} 10.53.0.0/16 10.53.12.254      <2>
+ovn-nbctl lr-route-add ${gr} 172.31.0.0/16 172.31.255.2     <3>
+ovn-nbctl lr-route-add ${router} 0.0.0.0/0 172.31.255.1     <4>
+----
+<1> Static route for internet traffic.
+<2> Static route for `legacy` networks.
+<3> Static route for overlay networks.
+<4> Static route for all external networks.
+
+[[adding-logical-switch-ports]]
+==== Adding Logical Switch Ports
+
+----
+# Router
+ovn-nbctl --may-exist lsp-add ${desk} ${desk}_${router}
+ovn-nbctl --may-exist lsp-add ${prod} ${prod}_${router}
+ovn-nbctl --may-exist lsp-add ${ose} ${ose}_${router}
+ovn-nbctl --may-exist lsp-add ${transit} ${transit}_${router}
+ovn-nbctl --may-exist lsp-add ${outsw} ${outsw}_${gr}
+ovn-nbctl --may-exist lsp-add ${transit} ${transit}_${gr}
+
+# Physical devices
+ovn-nbctl --may-exist lsp-add ${desk} ${desk}_bromine
+ovn-nbctl --may-exist lsp-add ${prod} ${prod}_uranium
+
+# Gateway
+ovn-nbctl --may-exist lsp-add ${outsw} ${outsw}_localnet
+----
+
+[[setting-logical-switch-port-configuration]]
+==== Setting Logical Switch Port Configuration
+
+[source,bash]
+----
+ovn-nbctl lsp-set-type ${desk}_${router} router
+ovn-nbctl lsp-set-addresses ${desk}_${router} 02:ac:10:1f:33:01
+ovn-nbctl lsp-set-options ${desk}_${router} router-port=${router}_${desk}
+
+ovn-nbctl lsp-set-type ${prod}_${router} router
+ovn-nbctl lsp-set-addresses ${prod}_${router} 02:ac:10:1f:34:01
+ovn-nbctl lsp-set-options ${prod}_${router} router-port=${router}_${prod}
+
+ovn-nbctl lsp-set-type ${ose}_${router} router
+ovn-nbctl lsp-set-addresses ${ose}_${router} 02:ac:10:1f:32:01
+ovn-nbctl lsp-set-options ${ose}_${router} router-port=${router}_${ose}
+
+ovn-nbctl lsp-set-type ${outsw}_${gr} router
+ovn-nbctl lsp-set-addresses ${outsw}_${gr} 02:ac:10:1f:0c:f6
+ovn-nbctl lsp-set-options ${outsw}_${gr} router-port=${gr}_${outsw}
+
+ovn-nbctl lsp-set-type ${transit}_${gr} router
+ovn-nbctl lsp-set-addresses ${transit}_${gr} 02:ac:10:1f:ff:01
+ovn-nbctl lsp-set-options ${transit}_${gr} router-port=${gr}_${transit}
+
+ovn-nbctl lsp-set-type ${transit}_${router} router
+ovn-nbctl lsp-set-addresses ${transit}_${router} 02:ac:10:1f:ff:02
+ovn-nbctl lsp-set-options ${transit}_${router} router-port=${router}_${transit}
+
+ovn-nbctl lsp-set-type ${outsw}_localnet localnet
+ovn-nbctl lsp-set-addresses ${outsw}_localnet unknown
+ovn-nbctl lsp-set-options ${outsw}_localnet network_name=dmz_localnet
+
+ovn-nbctl lsp-set-addresses ${desk}_bromine unknown
+ovn-nbctl lsp-set-addresses ${prod}_uranium unknown
+----
+
+
+[[virtualization]]
+== Virtualization
+
+After getting a few physical machines up and running on OVN the next step
+was my real hypervisor nodes.  This was more of a challenge than I
+originally thought it was going to be. I started by reviewing this
+https://blog.scottlowe.org/2016/12/09/using-ovn-with-kvm-libvirt/[blog post] which
+certainly provided valuable insight. Though being a lazy programmer there had to
+be a better way - https://www.libvirt.org/hooks.html[libvirt hooks].
+
+=== Installing the libvirt qemu hook
+
+Provided in this repository is a `qemu` hook for OVN.  It adds and removes the
+switch port when the machine is started or stopped.  The configuration
+for the `ovn-northd` node and the switch name is stored in the virtual machines
+metadata.
+
+First some prerequisites.
+
+[source,bash]
+----
+dnf install git -y
+pip install ovsdbapp
+git clone https://github.com/jcpowermac/homelab-ovn
+----
+
+If the directory doesn't exist (which it didn't on my hypervisor) create it.
+[source,bash]
+----
+mkdir -p /etc/libvirt/hooks/
+cp homelab-ovn/libvirt-hook/qemu /etc/libvirt/hooks/
+chmod 744 /etc/libvirt/hooks/qemu
+----
+
+After the hook is available libvirtd needs to be restarted.
+[source,bash]
+----
+systemctl restart libvirtd
+----
+
+[[add-ovn-metadata-to-virtual-machine]]
+=== Add OVN metadata to virtual machine
+
+The `virsh metadata` command below adds metadata to a defined virtual machine.
+This command *must* be written exactly as below for the `qemu` hook to
+function properly.
+
+[source,bash]
+----
+virt-install --import --name $vm --memory 8192 --vcpus 2 \
+	         --graphics none --console pty,target_type=serial \
+             --os-type linux --os-variant rhel7.0 --noautoconsole \
+			 --disk path=/instances/$vm.qcow2,format=qcow2,bus=virtio \
+			 --network bridge=br-int,virtualport_type=openvswitch 		<1>
+sleep 30
+virsh shutdown $vm
+sleep 20
+virsh metadata $vm --uri ovs \
+                   --key ovn \
+               --set '<parameters northd="172.30.1.10" switch="sw50"/>' <2>
+----
+<1> The virtual machine must attach to the `br-int` bridge and have a
+virtualport_type of openshift
+<2> The parameters are farily simple, `northd` is the ip address of `ovn-northd` node and `switch` is where the virtual machine should be connected.
+
+
+[[visualizations]]
+== Visualizations
+
+Sometimes its better to have a picture or two.
+
+[[skydive]]
+=== Skydive
+
+image:attachment:skydive.png[skydive.png]
+
+[appendix]
+== References
+=== Jupyter
+- https://ucsd-ccbb.github.io/visJS2jupyter
+- https://networkx.github.io/documentation/stable/index.html
+- Missing links for ipywidgets, matplotlib
+
+=== OVN
+- https://scottlowe.org/2016/12/09/using-ovn-with-kvm-libvirt/
+- https://www.pydoc.io/pypi/ovsdbapp-0.9.0/index.html
+- https://github.com/oVirt/ovirt-provider-ovn
+- https://github.com/openvswitch/ovs/blob/master/tests/ovn.at
+- http://blog.spinhirne.com/2016/09/an-introduction-to-ovn-routing.html
+
+=== Libvirt Hooks
+- https://libvirt.org/formatdomain.html#elementsMetadata
+- https://www.libvirt.org/hooks.html
+- https://github.com/rhardouin/libvirt_hooks
