@@ -1,20 +1,21 @@
 = Using Open Virtual Network Lab Layer-3 Switch Replacement
+ifdef::backend-pdf[]
 :doctype: book
 :compat-mode!:
-:numbered:
-:chapter-label:
-:specialnumbered!:
+:pagenums: :pygments-style: bw :source-highlighter: pygments
 :experimental:
-:listing-caption: Listing
+:specialnumbered!:
+:chapter-label:
+endif::[]
+:imagesdir: images
+:numbered:
 :toc:
+:toc-placement: preamble
 :icons: font
 :toclevels: 3
-ifdef::backend-pdf[]
-:pagenums: :pygments-style: bw :source-highlighter: pygments
-endif::[]
-:toc-placement!:
-toc::[]
+:showtitle:
 
+{empty}
 
 [[motivation]]
 == Motivation
@@ -104,9 +105,6 @@ systemctl enable openvswitch
 systemctl enable ovn-controller
 ----
 
-
-
-
 [[allow-north-and-south-bound-connections]]
 ==== Allow north and south bound connections
 
@@ -128,9 +126,9 @@ listed them below.
 
 [source,bash]
 ----
-CENTRAL_IP=172.30.1.10  <1>
+CENTRAL_IP=172.30.1.10      <1>
 ENCAP_TYPE=geneve
-LOCAL_IP=172.30.1.52    <2>
+LOCAL_IP=172.30.1.52        <2>
 
 ovs-vsctl set open . external_ids:ovn-remote="tcp:${CENTRAL_IP}:6642"
 ovs-vsctl set open . external_ids:ovn-nb="tcp:${CENTRAL_IP}:6641"
@@ -224,6 +222,10 @@ ifup enp2s5
 [[hypervisor-nodes-network-config]]
 ==== Hypervisor node network config
 
+The end goal is to have all network traffic on the overlay so each physical
+machine will have a OVS interface port configure. This configuration
+for this example will be in file `/etc/sysconfig/network-scripts/ifcfg-bromine`.
+
 [source,bash]
 ----
 DEVICE=bromine
@@ -231,7 +233,7 @@ NAME=bromine
 TYPE=OVSIntPort
 DEVICETYPE=ovs
 OVS_BRIDGE=br-int
-OVS_EXTRA="set Interface bromine external_ids:iface-id=sw51_bromine" <1>
+OVS_EXTRA="set Interface bromine external_ids:iface-id=sw51_bromine"    <1>
 IPADDR=172.31.51.52
 NETMASK=255.255.255.0
 GATEWAY=172.31.51.1
@@ -242,6 +244,13 @@ DNS2=10.53.252.246
 ----
 <1> The `iface-id` will be name provided in the `lsp-add` command.
 
+Bring up the interface but it won't pass traffic until the logical switch port is
+created.
+
+[source,bash]
+----
+ifup bromine
+----
 
 [[create-ovn-switches-routers-and-static-routes]]
 === Create OVN switches, routers and static routes
@@ -255,7 +264,7 @@ guide] so I recommend reading it for additional information.
 
 Normal switches: `sw50`, `sw51`, and `sw52`.
 
-Transit Switch use between router `r0` and the gateway router `gr0`. Assuming
+Transit switch is between router `r0` and the gateway router `gr0`. Assuming
 this is to allow `r0` to be distributed while maintaining a connection to the
 localized `gr0`.
 
@@ -286,13 +295,14 @@ gr=gr0
 
 ovn-nbctl --may-exist lr-add ${router}
 chassis_uuid=$(ovn-sbctl --bare --columns name find Chassis hostname=ovn-gateway0.virtomation.com)
-ovn-nbctl create Logical_Router name=${gr} options:chassis=${chassis_uuid} <1>
+ovn-nbctl create Logical_Router name=${gr} options:chassis=${chassis_uuid}      <1>
 ----
 <1> The gateway router must be configured on a specific node or chassis.
 
 [[adding-logical-router-ports]]
 ==== Adding Logical Router Ports
 
+Create logical router ports with mac and ip addresses for each network.
 
 [source,bash]
 ----
@@ -307,6 +317,9 @@ ovn-nbctl --may-exist lrp-add ${gr} ${gr}_${outsw} 02:ac:10:1f:0c:f6 10.53.12.24
 [[adding-static-routes]]
 ==== Adding Static Routes
 
+Create static routes to enable traffic between networks.
+
+[source,bash]
 ----
 ovn-nbctl lr-route-add ${gr} 0.0.0.0/0 10.53.12.1           <1>
 ovn-nbctl lr-route-add ${gr} 10.53.0.0/16 10.53.12.254      <2>
@@ -321,6 +334,9 @@ ovn-nbctl lr-route-add ${router} 0.0.0.0/0 172.31.255.1     <4>
 [[adding-logical-switch-ports]]
 ==== Adding Logical Switch Ports
 
+Create logical switch ports for each router, physical device and the gateway.
+
+[source,bash]
 ----
 # Router
 ovn-nbctl --may-exist lsp-add ${desk} ${desk}_${router}
@@ -330,7 +346,7 @@ ovn-nbctl --may-exist lsp-add ${transit} ${transit}_${router}
 ovn-nbctl --may-exist lsp-add ${outsw} ${outsw}_${gr}
 ovn-nbctl --may-exist lsp-add ${transit} ${transit}_${gr}
 
-# Physical devices
+# Physical
 ovn-nbctl --may-exist lsp-add ${desk} ${desk}_bromine
 ovn-nbctl --may-exist lsp-add ${prod} ${prod}_uranium
 
@@ -341,8 +357,11 @@ ovn-nbctl --may-exist lsp-add ${outsw} ${outsw}_localnet
 [[setting-logical-switch-port-configuration]]
 ==== Setting Logical Switch Port Configuration
 
+For each port configure the type, allowed address, and appropriate options.
+
 [source,bash]
 ----
+# Router
 ovn-nbctl lsp-set-type ${desk}_${router} router
 ovn-nbctl lsp-set-addresses ${desk}_${router} 02:ac:10:1f:33:01
 ovn-nbctl lsp-set-options ${desk}_${router} router-port=${router}_${desk}
@@ -367,14 +386,15 @@ ovn-nbctl lsp-set-type ${transit}_${router} router
 ovn-nbctl lsp-set-addresses ${transit}_${router} 02:ac:10:1f:ff:02
 ovn-nbctl lsp-set-options ${transit}_${router} router-port=${router}_${transit}
 
+# Gateway
 ovn-nbctl lsp-set-type ${outsw}_localnet localnet
 ovn-nbctl lsp-set-addresses ${outsw}_localnet unknown
 ovn-nbctl lsp-set-options ${outsw}_localnet network_name=dmz_localnet
 
+# Physical
 ovn-nbctl lsp-set-addresses ${desk}_bromine unknown
 ovn-nbctl lsp-set-addresses ${prod}_uranium unknown
 ----
-
 
 [[virtualization]]
 == Virtualization
@@ -382,16 +402,16 @@ ovn-nbctl lsp-set-addresses ${prod}_uranium unknown
 After getting a few physical machines up and running on OVN the next step
 was my real hypervisor nodes.  This was more of a challenge than I
 originally thought it was going to be. I started by reviewing this
-https://blog.scottlowe.org/2016/12/09/using-ovn-with-kvm-libvirt/[blog post] which
-certainly provided valuable insight. Though being a lazy programmer there had to
+https://blog.scottlowe.org/2016/12/09/using-ovn-with-kvm-libvirt/[blog post: Using OVN with KVM and Libvirt]
+which certainly provided valuable insight. Though being a lazy programmer there had to
 be a better way - https://www.libvirt.org/hooks.html[libvirt hooks].
 
 === Installing the libvirt qemu hook
 
-Provided in this repository is a `qemu` hook for OVN.  It adds and removes the
-switch port when the machine is started or stopped.  The configuration
-for the `ovn-northd` node and the switch name is stored in the virtual machines
-metadata.
+Provided in this repository is a https://github.com/jcpowermac/homelab-ovn/blob/master/libvirt-hook/qemu[qemu]
+hook for OVN. It adds and removes the switch port when the machine is started or stopped.
+The configuration for the `ovn-northd` node and the switch name is stored in
+the virtual machines metadata.
 
 First some prerequisites.
 
@@ -419,8 +439,9 @@ systemctl restart libvirtd
 [[add-ovn-metadata-to-virtual-machine]]
 === Add OVN metadata to virtual machine
 
-The `virsh metadata` command below adds metadata to a defined virtual machine.
-This command *must* be written exactly as below for the `qemu` hook to
+The `virt-install` command is an example the `--network` option that must be used to connect a
+virtual machine to a specific logical switch. The `virsh metadata` command below adds metadata
+to a defined virtual machine. This command *must* be written exactly as below for the `qemu` hook to
 function properly.
 
 [source,bash]
@@ -429,17 +450,15 @@ virt-install --import --name $vm --memory 8192 --vcpus 2 \
 	         --graphics none --console pty,target_type=serial \
              --os-type linux --os-variant rhel7.0 --noautoconsole \
 			 --disk path=/instances/$vm.qcow2,format=qcow2,bus=virtio \
-			 --network bridge=br-int,virtualport_type=openvswitch 		<1>
-sleep 30
-virsh shutdown $vm
-sleep 20
+			 --network bridge=br-int,virtualport_type=openvswitch           <1>
 virsh metadata $vm --uri ovs \
                    --key ovn \
-               --set '<parameters northd="172.30.1.10" switch="sw50"/>' <2>
+               --set '<parameters northd="172.30.1.10" switch="sw50"/>'     <2>
 ----
 <1> The virtual machine must attach to the `br-int` bridge and have a
-virtualport_type of openshift
-<2> The parameters are farily simple, `northd` is the ip address of `ovn-northd` node and `switch` is where the virtual machine should be connected.
+`virtualport_type` of `openvswitch`.
+<2> The parameters are farily simple, `northd` is the ip address of `ovn-northd` node and
+`switch` is where the virtual machine should be connected.
 
 
 [[visualizations]]
@@ -450,7 +469,17 @@ Sometimes its better to have a picture or two.
 [[skydive]]
 === Skydive
 
-image:attachment:skydive.png[skydive.png]
+As I suggested above running https://github.com/skydive-project/skydive[Skydive] is a good idea.
+At least then you have a visual representation of the interfaces and bridges that are used.
+
+image::skydive.png[Skydive]
+
+[[jupyter]]
+=== OVN topology using Jupyter
+
+Included in this repo is a https://github.com/jcpowermac/homelab-ovn/blob/master/jupyter-visualization/openvswitch-ovn.ipynb[Jupyter notebook].  It currently displays logical routers, switches, ports, and networks on the edge.
+
+image::ovn.png[OVN]
 
 [appendix]
 == References
