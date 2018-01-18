@@ -1,4 +1,4 @@
-= Using Open Virtual Network Lab Layer-3 Switch Replacement
+= Using Open Virtual Network Layer-3 Switch Replacement
 ifdef::backend-pdf[]
 :doctype: book
 :compat-mode!:
